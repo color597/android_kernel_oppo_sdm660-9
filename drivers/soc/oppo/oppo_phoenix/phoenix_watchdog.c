@@ -1,0 +1,204 @@
+/*
+###############################################################################
+## Copyright 2018 OPPO Mobile Comm Corp., Ltd.
+##
+## File: phoenix_watchdog.c
+## Description : add for project phenix(hang oppo)
+##
+##
+##
+## Version:  1.0
+## Date:  2018/12/24
+## Author:  bright.zhang@oppo.com
+## ----------------- Revision History: ----------------------
+## <author>       <data>           <desc>
+## Bright Zhang   2018/12/24       create this file
+## Kun Hu         2019/06/11       refactoring phoenix hlos watchdog,
+                                   normalize log format
+################################################################################
+*/
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kthread.h>
+#include <linux/syscalls.h>
+#include <soc/oppo/boot_mode.h>
+#include <linux/fs.h>
+#include "oppo_phoenix.h"
+
+#define DELAY_TIME                      30
+#define MAX_CMD_LENGTH                  32
+
+
+#if defined(CONFIG_OPPO_DAILY_BUILD)    //user version
+#define DEFAULT_PHX_WD_PET_TIME         600
+#else
+#if defined(CONFIG_OPPO_SPECIAL_BUILD)  //aging test version
+#define DEFAULT_PHX_WD_PET_TIME         960
+#else                                   //release version
+#define DEFAULT_PHX_WD_PET_TIME         600
+#endif
+#endif
+
+static int hang_oppo_main_on = 1;   //default on
+int hang_oppo_recovery_method = RESTART_AND_RECOVERY;
+static int phx_hlos_wd_pet_time = DEFAULT_PHX_WD_PET_TIME;
+
+static int __init hang_oppo_main_on_init(char *str)
+{
+    get_option(&str,&hang_oppo_main_on);
+
+    pr_info("hang_oppo_main_on %d\n", hang_oppo_main_on);
+
+    return 1;
+}
+__setup("phx_rus_conf.main_on=", hang_oppo_main_on_init);
+
+static int __init hang_oppo_recovery_method_init(char *str)
+{
+    get_option(&str,&hang_oppo_recovery_method);
+
+    pr_info("hang_oppo_recovery_method %d\n", hang_oppo_recovery_method);
+
+    return 1;
+}
+__setup("phx_rus_conf.recovery_method=", hang_oppo_recovery_method_init);
+
+static int __init phx_hlos_wd_pet_time_init(char *str)
+{
+    get_option(&str,&phx_hlos_wd_pet_time);
+
+    pr_info("phx_hlos_wd_pet_time %d\n", phx_hlos_wd_pet_time);
+
+    return 1;
+}
+__setup("phx_rus_conf.kernel_time=", phx_hlos_wd_pet_time_init);
+
+int is_phoenix_enable(void)
+{
+    return hang_oppo_main_on;
+}
+
+EXPORT_SYMBOL(is_phoenix_enable);
+
+int phx_is_long_time(void)
+{
+    struct file *opfile;
+    ssize_t size;
+    loff_t offsize;
+    char data_info[16] = {'\0'};
+    mm_segment_t old_fs;
+
+    opfile = filp_open("/proc/opbootfrom", O_RDONLY, 0444);
+    if (IS_ERR(opfile)) {
+        PHX_KLOG_ERROR("open /proc/opbootfrom error:\n");
+        return -1;
+    }
+
+    offsize = 0;
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+    size = vfs_read(opfile,data_info,sizeof(data_info),&offsize);
+    if (size < 0) {
+        PHX_KLOG_ERROR("data_info %s size %ld", data_info, size);
+        set_fs(old_fs);
+        return -1;
+    }
+    set_fs(old_fs);
+    filp_close(opfile,NULL);
+
+    if (strncmp(data_info, "normal", 6) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int phx_is_boot_into_native(void)
+{
+    return !sys_access("/proc/opbootfrom", 0);
+}
+
+static int phx_is_gsi_test(void)
+{
+    return sys_access("/init.oppo.rc", 0);
+}
+
+static int phx_pet(void)
+{
+    PHX_KLOG_INFO("phoenix watchdog pet!\n");
+
+    if(phx_is_long_time())
+    {
+        schedule_timeout_interruptible(phx_hlos_wd_pet_time * HZ);
+    }
+
+    if(!phx_is_system_boot_completed())
+    {
+        // check if this version is google gsi version
+        if(phx_is_boot_into_native() && phx_is_gsi_test())
+        {
+            return 0;
+        }
+        phx_set_boot_error(ERROR_HANG_OPPO);
+    }
+    return 0;
+
+}
+
+//start phoenix high level os watchdog
+static int phoenix_watchdog_kthread(void *dummy)
+{
+    schedule_timeout_uninterruptible(phx_hlos_wd_pet_time * HZ);
+    phx_pet();
+    return 0;
+}
+
+static int __init phx_is_nomal_mode(void)
+{
+    int i;
+    char *substr;
+    char boot_mode[MAX_CMD_LENGTH + 1];
+    const char * const normal_boot_mode_list[] = {"normal", "reboot", "kernel"};
+    substr =  strstr(boot_command_line, "androidboot.mode=");
+    if (substr)
+    {
+        substr += strlen("androidboot.mode=");
+        for (i=0; substr[i] != ' ' && i < MAX_CMD_LENGTH && substr[i] != '\0'; i++)
+        {
+            boot_mode[i] = substr[i];
+        }
+        boot_mode[i] = '\0';
+
+        if( MSM_BOOT_MODE__NORMAL != get_boot_mode())
+        {
+            return 0;
+        }
+
+        for( i = 0; i < ARRAY_SIZE(normal_boot_mode_list); i++)
+        {
+            if(!strcmp(boot_mode, normal_boot_mode_list[i]))
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int __init phoenix_hlos_watchdog_init(void)
+{
+    int ret = 0;
+    PHX_KLOG_INFO("phoenix hlos watchdog: %s\n", hang_oppo_main_on ? "on" : "off");
+
+    if(hang_oppo_main_on && phx_is_nomal_mode())
+    {
+        kthread_run(phoenix_watchdog_kthread, NULL,	"phoenix_hlos_watchdog");
+    }
+
+    return ret;
+}
+arch_initcall_sync(phoenix_hlos_watchdog_init);
+
+MODULE_DESCRIPTION("OPPO PHOENIX HLOS WATCHDOG");
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("Bright.Zhang <bright.zhang@oppo.com>");
+

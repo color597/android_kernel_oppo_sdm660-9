@@ -1,0 +1,7 @@
+# ifdef VENDOR_EDIT
+#//jie.cheng@swdh.sh, 2016/04/15, Add hypnus helper
+config HYPNUS_HELPER
+bool "config hypnus helper"
+help
+    Provide helper functions for hypnus.
+#endif /* VENDOR_EDIT */
